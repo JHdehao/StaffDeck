@@ -125,6 +125,11 @@ def _listening_pids(port: int) -> list[int]:
 def _port_available(host: str, port: int) -> bool:
     bind_host = "0.0.0.0" if host == "0.0.0.0" else host
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # Without SO_REUSEADDR a plain bind() also fails while the previous
+        # listener's sockets sit in TIME_WAIT after a restart, which reads
+        # as "port in use by unknown process" and sends the supervisor into
+        # a retry loop for up to a minute even though nothing is listening.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((bind_host, port))
             return True
@@ -195,13 +200,61 @@ def _npm_executable() -> str:
     raise RuntimeError("npm is not available on PATH; install Node.js 20 or newer")
 
 
+def _frontend_sources_digest() -> str:
+    import hashlib
+
+    frontend = ROOT_DIR / "frontend-enterprise"
+    watched = [
+        frontend / "src",
+        frontend / "public",
+        frontend / "index.html",
+        frontend / "package.json",
+        frontend / "package-lock.json",
+        frontend / "components.json",
+        frontend / "tsconfig.json",
+        frontend / "vite.config.ts",
+    ]
+    digest = hashlib.sha256()
+    for root in watched:
+        if root.is_file():
+            stat = root.stat()
+            digest.update(f"{root}:{stat.st_mtime_ns}:{stat.st_size}".encode())
+        elif root.is_dir():
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    stat = path.stat()
+                    digest.update(f"{path}:{stat.st_mtime_ns}:{stat.st_size}".encode())
+    return digest.hexdigest()
+
+
 def _build_frontend() -> None:
+    # The frontend bundle only depends on the frontend source tree, but this
+    # runs on every service (re)start — including the many restarts systemd
+    # issues around deploys — and a full tsc+vite build keeps the app port
+    # down for over a minute each time. Skip it when the sources haven't
+    # changed since the last successful build; FORCE_FRONTEND_BUILD=1
+    # overrides the skip if the stamp is ever wrong.
+    frontend = ROOT_DIR / "frontend-enterprise"
+    stamp_file = frontend / "dist" / ".build-stamp"
+    digest = _frontend_sources_digest()
+    if (
+        not _env_flag("FORCE_FRONTEND_BUILD")
+        and (frontend / "dist" / "index.html").exists()
+        and stamp_file.exists()
+        and stamp_file.read_text(encoding="utf-8").strip() == digest
+    ):
+        print("Frontend sources unchanged; skipping rebuild.")
+        return
     print("Building frontend bundle for single-port app...")
     subprocess.run(
-        [_npm_executable(), "--prefix", str(ROOT_DIR / "frontend-enterprise"), "run", "build"],
+        [_npm_executable(), "--prefix", str(frontend), "run", "build"],
         cwd=ROOT_DIR,
         check=True,
     )
+    # Recompute after the build: the toolchain may touch watched files
+    # during the build itself, and a stamp taken beforehand would then be
+    # permanently stale, forcing a rebuild on every start.
+    stamp_file.write_text(_frontend_sources_digest(), encoding="utf-8")
 
 
 def _url_ready(url: str) -> bool:
