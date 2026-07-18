@@ -2235,3 +2235,63 @@ def _test_session():
     )
     SQLModel.metadata.create_all(engine)
     return Session(engine)
+
+
+def test_general_skill_outputs_keep_valid_result_despite_stray_stderr() -> None:
+    # A model-generated runner occasionally leaks a warning to stderr even
+    # though it computed a correct, non-empty structured_result. Losing that
+    # result and showing the user a raw stderr dump instead is worse than
+    # tolerating the stray stderr noise.
+    with _test_session() as db:
+        run_response = GeneralSkillRunResponse(
+            skill_slug="demo-calc-skill",
+            stdout='{"status": "success", "data": {"value": 42}}',
+            stderr="UserWarning: something noisy but harmless\n",
+            structured_result={"status": "success", "data": {"value": 42}},
+            reply="计算已完成。",
+        )
+        step_result, tool_result = AgentLoop(db)._general_skill_agent_outputs(run_response)
+
+        assert tool_result.success is True
+        assert tool_result.error is None
+        assert tool_result.data["structured_result"] == run_response.structured_result
+        assert step_result.is_step_completed is True
+
+
+def test_general_skill_outputs_still_fail_on_stderr_with_no_result() -> None:
+    # A genuine crash never reaches the point of printing a structured
+    # result, so an empty structured_result plus stderr must still fail —
+    # the fix above must not weaken this safety net.
+    with _test_session() as db:
+        run_response = GeneralSkillRunResponse(
+            skill_slug="demo-calc-skill",
+            stdout="",
+            stderr="Traceback (most recent call last):\n...\nZeroDivisionError\n",
+            structured_result={},
+            reply="",
+        )
+        step_result, tool_result = AgentLoop(db)._general_skill_agent_outputs(run_response)
+
+        assert tool_result.success is False
+        assert tool_result.data is None
+        assert tool_result.error is not None
+        assert tool_result.error.code == "GENERAL_SKILL_FAILED"
+        assert step_result.is_step_completed is False
+
+
+def test_general_skill_outputs_still_fail_on_explicit_success_false() -> None:
+    # structured_result explicitly reporting failure must still fail even
+    # if stderr happens to be empty.
+    with _test_session() as db:
+        run_response = GeneralSkillRunResponse(
+            skill_slug="demo-calc-skill",
+            stdout='{"success": false, "error": "input not supported"}',
+            stderr="",
+            structured_result={"success": False, "error": "input not supported"},
+            reply="输入不在支持范围内。",
+        )
+        step_result, tool_result = AgentLoop(db)._general_skill_agent_outputs(run_response)
+
+        assert tool_result.success is False
+        assert tool_result.data is None
+        assert step_result.is_step_completed is False

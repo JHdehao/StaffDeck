@@ -687,10 +687,19 @@ class AgentLoop:
     def _general_skill_agent_outputs(
         self, run_response: GeneralSkillRunResponse
     ) -> tuple[StepAgentResult, ToolResult]:
-        success = (
-            bool(run_response.structured_result.get("success", True))
-            and not run_response.stderr.strip()
-        )
+        structured_result_ok = bool(run_response.structured_result.get("success", True))
+        # A non-empty stderr alone is treated as a crash signal (generated
+        # runner code has no other reliable way to report "something went
+        # wrong" back to us), but it shouldn't override an otherwise valid,
+        # non-empty structured_result that doesn't itself report failure —
+        # models occasionally leak a warning/deprecation notice to stderr
+        # even though the underlying computation succeeded, and discarding
+        # a correct answer in that case is worse than tolerating the noise.
+        # A genuine crash leaves structured_result empty (nothing was ever
+        # printed to stdout before the process died), so this still fails
+        # closed for real failures.
+        stderr_is_fatal = bool(run_response.stderr.strip()) and not run_response.structured_result
+        success = structured_result_ok and not stderr_is_fatal
         data = {
             "skill_slug": run_response.skill_slug,
             "reply": run_response.reply,
