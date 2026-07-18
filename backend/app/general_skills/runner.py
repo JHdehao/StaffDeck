@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import selectors
 import subprocess
 import sys
@@ -515,6 +516,7 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         attempt: int = 1,
     ) -> tuple[str, str, dict[str, Any]]:
+        plan.code = _strip_markdown_link_wrapping(plan.code)
         run_dir = Path(mkdtemp(prefix="ultrarag_general_skill_"))
         skill_dir = run_dir / "skill"
         _materialize_skill_package(skill, skill_dir)
@@ -783,6 +785,24 @@ def _truncate(value: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "\n...<truncated>"
+
+
+# Some models have a strong habit of always Markdown-hyperlinking URLs they
+# emit, even inside generated source code where the URL needs to be a plain
+# string literal (e.g. `requests.post("[http://x](http://x)")`), which
+# breaks at execution time. Prompting against this has proven unreliable
+# across models (and adds tokens to every call, including models that never
+# make this mistake), so we deterministically strip it from generated code
+# right before executing it instead. Scoped to the `[url](url)` — identical
+# link text and target — pattern specifically, since that exact duplication
+# never occurs in legitimate hand-written Markdown (a real link's visible
+# text and its target differ); this keeps the fix a no-op for any skill
+# whose generated code has a genuine reason to construct Markdown links.
+_MARKDOWN_URL_WRAP_RE = re.compile(r"\[(https?://[^\]\s]+)\]\(\1\)")
+
+
+def _strip_markdown_link_wrapping(code: str) -> str:
+    return _MARKDOWN_URL_WRAP_RE.sub(r"\1", code)
 
 
 def _plan_runtime(plan: GeneralSkillExecutionPlan) -> str:

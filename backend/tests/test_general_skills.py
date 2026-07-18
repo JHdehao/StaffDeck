@@ -33,7 +33,7 @@ from app.db.models import (
     Tenant,
     User,
 )
-from app.general_skills.runner import GeneralSkillRunner, GeneralSkillSelector
+from app.general_skills.runner import GeneralSkillRunner, GeneralSkillSelector, _strip_markdown_link_wrapping
 from app.general_skills.schema import (
     GeneralSkillClawHubImportRequest,
     GeneralSkillImportRequest,
@@ -2295,3 +2295,26 @@ def test_general_skill_outputs_still_fail_on_explicit_success_false() -> None:
         assert tool_result.success is False
         assert tool_result.data is None
         assert step_result.is_step_completed is False
+
+
+def test_strip_markdown_link_wrapping_fixes_duplicated_url() -> None:
+    # Some models habitually Markdown-hyperlink URLs even inside generated
+    # source code, producing a string literal that's a link with itself as
+    # both the visible text and the target — e.g.
+    # requests.post("[http://x](http://x)") — which requests can't parse.
+    code = 'url = "[http://127.0.0.1:8901/schedule](http://127.0.0.1:8901/schedule)"\nrequests.post(url)\n'
+    fixed = _strip_markdown_link_wrapping(code)
+    assert fixed == 'url = "http://127.0.0.1:8901/schedule"\nrequests.post(url)\n'
+
+
+def test_strip_markdown_link_wrapping_leaves_genuine_markdown_links_alone() -> None:
+    # A real Markdown link has different visible text and target — that
+    # must never be touched, since some skill's generated code may
+    # legitimately build a Markdown-formatted report as its output.
+    code = 'line = "[查看看板](http://example.internal:3000/d/history/)"\n'
+    assert _strip_markdown_link_wrapping(code) == code
+
+
+def test_strip_markdown_link_wrapping_is_noop_without_the_pattern() -> None:
+    code = 'url = "http://127.0.0.1:8901/schedule"\nprint(requests.get(url).json())\n'
+    assert _strip_markdown_link_wrapping(code) == code
