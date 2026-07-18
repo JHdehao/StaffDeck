@@ -923,7 +923,21 @@ def chat_turn(
             response, _draft = scheduled_response
             _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
             return response
-    response = AgentLoop(db).handle_turn(request)
+    # Buffer LLM-call span events during the turn and persist them once the
+    # session id is known, so token-usage accounting covers this non-stream
+    # path the same way the /stream endpoint's live sink already does.
+    buffered_span_events: list[tuple[str, dict[str, object]]] = []
+
+    def _buffer_span_event(event_type: str, payload: dict[str, object]) -> None:
+        buffered_span_events.append((event_type, dict(payload)))
+
+    span_sink_token = set_span_sink(_buffer_span_event)
+    try:
+        response = AgentLoop(db).handle_turn(request)
+    finally:
+        reset_span_sink(span_sink_token)
+    for event_type, payload in buffered_span_events:
+        _persist_relay_only_event(db, request.tenant_id, response.session_id, event_type, payload)
     _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
     if request.interaction_mode == "scheduled_task" and request.agent_id:
         draft = detect_scheduled_task_draft(
