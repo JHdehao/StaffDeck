@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -28,6 +29,24 @@ from app.general_skills.runtime_env import GeneralSkillRuntimeError, ensure_runt
 from app.llm import LLMClient, LLMError
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
+
+
+# Opt-in per-attempt diagnostics for the retry pipeline (which stage ran, why
+# review demanded a retry, how many LLM calls a turn actually took). Enabled
+# by pointing STAFFDECK_GENERAL_SKILL_DIAG_LOG at a writable file path;
+# without it the logger has no handler and every call below is a no-op.
+_diag_logger = logging.getLogger("general_skill_diag")
+_diag_logger.propagate = False
+_DIAG_LOG_PATH = os.environ.get("STAFFDECK_GENERAL_SKILL_DIAG_LOG", "").strip()
+if _DIAG_LOG_PATH and not _diag_logger.handlers:
+    try:
+        _diag_handler = logging.FileHandler(_DIAG_LOG_PATH)
+        _diag_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _diag_logger.addHandler(_diag_handler)
+        _diag_logger.setLevel(logging.INFO)
+    except OSError:
+        # Diagnostics must never prevent the service from starting.
+        pass
 
 
 PROMPT_DIR = paths.resource_dir() / "app" / "llm" / "prompts"
@@ -101,6 +120,13 @@ class GeneralSkillSelector:
             )
         decision = GeneralSkillSelection.model_validate(raw)
         slugs = {skill.slug for skill in general_skills if skill.status == "published"}
+        _diag_logger.info(
+            "selector query=%r use_general_skill=%s selected_slug=%s confidence=%s",
+            query[:80],
+            decision.use_general_skill,
+            decision.selected_slug,
+            decision.confidence,
+        )
         if decision.use_general_skill and decision.selected_slug in slugs:
             return decision
         return decision.model_copy(update={"use_general_skill": False, "selected_slug": None})
@@ -145,6 +171,7 @@ class GeneralSkillRunner:
             )
 
         attempts: list[dict[str, Any]] = planning_attempts
+        planning_retries = len(planning_attempts)  # snapshot before the loop below mutates this same list
         stdout = ""
         stderr = ""
         structured_result: dict[str, Any] = {}
@@ -164,20 +191,49 @@ class GeneralSkillRunner:
                 attempt,
             )
             _normalize_failure_diagnostics(structured_result)
-            review = self._review_execution_result(
-                skill,
-                query,
-                model_config,
-                plan,
-                stdout,
-                stderr,
-                structured_result,
-                trace,
-                event_sink,
-                attempt,
-                conversation_context,
-                memory_context,
-            )
+            if (
+                structured_result
+                and _is_clean_execution(structured_result, stderr)
+                and not _code_makes_write_call(plan.code)
+            ):
+                # A read-only call that ran cleanly and produced a non-empty
+                # result doesn't need an LLM review pass: review can't verify
+                # domain correctness anyway (it has no independent source of
+                # truth) and in practice rubber-stamps these, so the extra
+                # call only adds latency and token cost. Failed, empty, or
+                # state-mutating executions still get the full review.
+                review = {
+                    "result_sufficient": True,
+                    "needs_retry": False,
+                    "terminal": False,
+                    "reason": "只读调用执行成功且有非空结果，跳过模型审查",
+                    "repair_hint": None,
+                    "skipped": True,
+                }
+                _emit(
+                    trace,
+                    {
+                        "phase": "review_skipped",
+                        "message": f"第 {attempt} 次运行为只读且无报错，跳过审查",
+                        "attempt": attempt,
+                    },
+                    event_sink,
+                )
+            else:
+                review = self._review_execution_result(
+                    skill,
+                    query,
+                    model_config,
+                    plan,
+                    stdout,
+                    stderr,
+                    structured_result,
+                    trace,
+                    event_sink,
+                    attempt,
+                    conversation_context,
+                    memory_context,
+                )
             attempts.append(
                 {
                     "attempt": attempt,
@@ -187,6 +243,18 @@ class GeneralSkillRunner:
                     "structured_result": structured_result,
                     "execution_review": review,
                 }
+            )
+            _diag_logger.info(
+                "attempt skill=%s attempt=%d needs_retry=%s result_sufficient=%s "
+                "structured_success=%s stderr=%r review_reason=%r repair_hint=%r",
+                skill.slug,
+                attempt,
+                review.get("needs_retry"),
+                review.get("result_sufficient"),
+                structured_result.get("success"),
+                (stderr or "")[:300],
+                (review.get("reason") or "")[:300],
+                (review.get("repair_hint") or "")[:300],
             )
             needs_retry = bool(review.get("needs_retry"))
             if (
@@ -294,6 +362,19 @@ class GeneralSkillRunner:
         except LLMError as exc:
             _emit(trace, {"phase": "reply_failed", "message": "模型生成最终回复失败", "error": str(exc)}, event_sink)
             reply = _fallback_reply(structured_result)
+        review_cycles = len(attempts) - planning_retries
+        total_llm_calls = 1 + planning_retries + 2 * review_cycles - (1 if review_cycles else 0) + 1
+        outcome = "success" if structured_result.get("success") is not False else "failed"
+        _diag_logger.info(
+            "run skill=%s query=%r planning_retries=%d review_cycles=%d "
+            "approx_llm_calls=%d outcome=%s",
+            skill.slug,
+            query[:80],
+            planning_retries,
+            review_cycles,
+            total_llm_calls,
+            outcome,
+        )
         return GeneralSkillRunResponse(
             skill_slug=skill.slug,
             execution_trace=trace,

@@ -1902,7 +1902,8 @@ def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
     assert response.reply == "已读取目录技能，城市是北京。"
     assert response.structured_result["city"] == "北京"
     assert response.structured_result["files"] == ["SKILL.md", "data/city.txt"]
-    assert calls == ["runner", "review", "reply"]
+    # 只读且执行干净的运行会跳过模型审查（见 runner.run 的 review-skip 逻辑）
+    assert calls == ["runner", "reply"]
 
 
 def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None:
@@ -1979,7 +1980,7 @@ def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None
 
     assert response.reply == "北京今天晴。"
     assert response.structured_result["city"] == "北京"
-    assert calls == ["runner", "review", "reply"]
+    assert calls == ["runner", "reply"]
     plan_events = [item for item in response.execution_trace if item["phase"] == "plan_created"]
     assert plan_events[0]["runtime"] == "bash"
 
@@ -2046,7 +2047,7 @@ def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
 
     assert response.reply == "requests 可用。"
     assert response.structured_result["requests_available"] is True
-    assert calls == ["runner", "review", "reply"]
+    assert calls == ["runner", "reply"]
 
 
 def test_general_skill_prompt_rejects_unlisted_external_apis() -> None:

@@ -124,7 +124,10 @@ def test_general_skill_substages_use_the_same_unified_system_prompt(monkeypatch)
         if phase == "Step Agent / General Skill Plan":
             return {
                 "runtime": "python",
-                "code": "print('{}')",
+                # 带写操作调用，确保 review 阶段不会被"只读跳过审查"逻辑跳过，
+                # 本测试需要覆盖全部四个阶段的 system prompt（代码不会真执行，
+                # _execute_plan 已被打桩）。
+                "code": "import requests\nrequests.post('http://x')\nprint('{}')",
                 "rationale": "执行测试",
                 "expected_output": "JSON",
             }
