@@ -189,6 +189,31 @@ class GeneralSkillRunner:
                 }
             )
             needs_retry = bool(review.get("needs_retry"))
+            if (
+                needs_retry
+                and _code_makes_write_call(plan.code)
+                and _is_clean_execution(structured_result, stderr)
+            ):
+                # This attempt already called a state-mutating endpoint (order/
+                # booking writes, etc.) and ran without an execution error —
+                # we cannot know whether review's dissatisfaction is with the
+                # write itself or just with how the result reads, but retrying
+                # means generating and running *new* code that could call the
+                # same write again (double booking, duplicate completion...).
+                # A successful write must never be silently repeated just to
+                # chase a nicer-sounding reply, so we stop here and let the
+                # reply phase work with what we already have.
+                _emit(
+                    trace,
+                    {
+                        "phase": "reflection_retry_blocked",
+                        "message": f"第 {attempt} 次运行已调用写操作接口且无执行错误，不再重试以避免重复触发副作用",
+                        "attempt": attempt,
+                        "review": review,
+                    },
+                    event_sink,
+                )
+                needs_retry = False
             if not needs_retry:
                 if structured_result.get("success") is False or review.get("result_sufficient") is False:
                     _emit(
@@ -803,6 +828,35 @@ _MARKDOWN_URL_WRAP_RE = re.compile(r"\[(https?://[^\]\s]+)\]\(\1\)")
 
 def _strip_markdown_link_wrapping(code: str) -> str:
     return _MARKDOWN_URL_WRAP_RE.sub(r"\1", code)
+
+
+# Static heuristic for "did this attempt's code call a state-mutating HTTP
+# endpoint" — matches requests.post/put/delete/patch(...) and an explicit
+# method="POST"/etc. kwarg (covers requests.request(...) and
+# urllib.request.Request(..., method=...)). We don't execute the code in a
+# sandbox that traces real network calls, so this is necessarily a heuristic
+# over the source text rather than a guarantee — but it only needs to be
+# conservative in one direction (never miss an actual write call); a false
+# positive just means we're slightly more cautious about retrying than
+# strictly necessary, which is the safe side to err on.
+_HTTP_WRITE_CALL_RE = re.compile(
+    r"requests\.(post|put|delete|patch)\s*\(" r"|method\s*=\s*[\"'](POST|PUT|DELETE|PATCH)[\"']",
+    re.IGNORECASE,
+)
+
+
+def _code_makes_write_call(code: str) -> bool:
+    return bool(_HTTP_WRITE_CALL_RE.search(code))
+
+
+def _is_clean_execution(structured_result: dict[str, Any], stderr: str) -> bool:
+    # Mirrors AgentLoop._general_skill_agent_outputs' success check: a
+    # non-empty structured_result that doesn't explicitly report failure
+    # means the code ran to completion, as opposed to crashing before ever
+    # producing output (empty structured_result) or explicitly failing.
+    structured_ok = bool(structured_result.get("success", True))
+    stderr_is_fatal = bool(stderr.strip()) and not structured_result
+    return structured_ok and not stderr_is_fatal
 
 
 def _plan_runtime(plan: GeneralSkillExecutionPlan) -> str:

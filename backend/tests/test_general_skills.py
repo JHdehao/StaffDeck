@@ -33,7 +33,12 @@ from app.db.models import (
     Tenant,
     User,
 )
-from app.general_skills.runner import GeneralSkillRunner, GeneralSkillSelector, _strip_markdown_link_wrapping
+from app.general_skills.runner import (
+    GeneralSkillRunner,
+    GeneralSkillSelector,
+    _code_makes_write_call,
+    _strip_markdown_link_wrapping,
+)
 from app.general_skills.schema import (
     GeneralSkillClawHubImportRequest,
     GeneralSkillImportRequest,
@@ -2318,3 +2323,92 @@ def test_strip_markdown_link_wrapping_leaves_genuine_markdown_links_alone() -> N
 def test_strip_markdown_link_wrapping_is_noop_without_the_pattern() -> None:
     code = 'url = "http://127.0.0.1:8901/schedule"\nprint(requests.get(url).json())\n'
     assert _strip_markdown_link_wrapping(code) == code
+
+
+def test_code_makes_write_call_detects_mutating_http_verbs() -> None:
+    assert _code_makes_write_call('requests.post("http://x/complete", json=body)\n')
+    assert _code_makes_write_call('requests.put("http://x", data=body)\n')
+    assert _code_makes_write_call('requests.delete("http://x")\n')
+    assert _code_makes_write_call('requests.patch("http://x", json=body)\n')
+    assert _code_makes_write_call('req = urllib.request.Request(url, method="POST")\n')
+
+
+def test_code_makes_write_call_ignores_read_only_code() -> None:
+    code = 'r = requests.get("http://x/schedule-overview")\nprint(r.json())\n'
+    assert not _code_makes_write_call(code)
+
+
+def test_general_skill_runner_does_not_retry_after_a_successful_write_call(monkeypatch) -> None:
+    # A write endpoint (POST /complete, /cancel, /schedule with commit=true,
+    # etc.) that already succeeded must never be called again just because
+    # the review phase wants a nicer-sounding reply — repairing means
+    # generating and running brand-new code, which could re-trigger the
+    # same side effect (double-booking, duplicate completion...).
+    calls: list[str] = []
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
+        if "代码修复器" in prompt_text:
+            calls.append("repair")
+            raise AssertionError("repair must not be called after a successful write")
+        if "通用技能执行器" in prompt_text:
+            calls.append("runner")
+            return {
+                "code": (
+                    "import json\n"
+                    "import requests\n"
+                    "try:\n"
+                    "    requests.post('http://127.0.0.1:9/complete', json={'id': 1}, timeout=0.01)\n"
+                    "except Exception:\n"
+                    "    pass\n"
+                    "print(json.dumps({'success': True, 'booking_id': 1}, ensure_ascii=False))\n"
+                ),
+                "rationale": "标记完工",
+            }
+        if "通用技能运行结果审查器" in prompt_text:
+            calls.append("review")
+            # Review is unsatisfied (e.g. thinks the reply needs more detail)
+            # even though the write itself succeeded cleanly.
+            return {
+                "result_sufficient": False,
+                "needs_retry": True,
+                "terminal": False,
+                "reason": "回复应该说明完工细节。",
+                "repair_hint": "补充完工后的顺延情况。",
+            }
+        if "通用技能结果回复器" in prompt_text:
+            calls.append("reply")
+            assert payload["structured_result"]["success"] is True
+            return {"reply": "已标记完工。"}
+        raise AssertionError("unexpected prompt")
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+
+    skill = GeneralSkill(
+        tenant_id="tenant_demo",
+        slug="demo-calc-skill",
+        name="示例计算技能",
+        description="示例计算技能",
+        skill_markdown="# 示例计算技能\n",
+        status="published",
+    )
+    model_config = ModelConfig(
+        tenant_id="tenant_demo",
+        name="Fake model",
+        api_key_encrypted=encrypt_secret("test-key"),
+        model="fake",
+        is_default=True,
+        enabled=True,
+    )
+
+    response = GeneralSkillRunner().run(
+        skill, "把这笔订单标记完工", model_config, max_attempts=3
+    )
+
+    assert calls == ["runner", "review", "reply"]
+    assert response.structured_result["success"] is True
+    assert any(item["phase"] == "reflection_retry_blocked" for item in response.execution_trace)
