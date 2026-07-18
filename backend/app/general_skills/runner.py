@@ -25,6 +25,8 @@ from app.general_skills.schema import (
     GeneralSkillRunResponse,
     GeneralSkillSelection,
 )
+from pydantic import ValidationError
+
 from app.general_skills.runtime_env import GeneralSkillRuntimeError, ensure_runtime_python, runtime_environment
 from app.llm import LLMClient, LLMError
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
@@ -430,7 +432,13 @@ class GeneralSkillRunner:
                 unified_system_prompt(skill.skill_markdown),
                 payload,
             )
-        plan = GeneralSkillExecutionPlan.model_validate(raw)
+        try:
+            plan = GeneralSkillExecutionPlan.model_validate(raw)
+        except ValidationError as exc:
+            # 模型偶尔会返回别的阶段形状的 JSON（比如把 selector 的输出当 plan 交上来）。
+            # 转成 LLMError 让外层的计划重试/修复循环接手，而不是让 ValidationError
+            # 一路炸穿变成整轮 AGENT_LOOP_ERROR。
+            raise LLMError(f"General skill runner plan has invalid schema: {exc}") from exc
         plan.runtime = _plan_runtime(plan)
         if not plan.code.strip():
             raise LLMError("General skill runner code is empty")
@@ -590,7 +598,10 @@ class GeneralSkillRunner:
                 unified_system_prompt(skill.skill_markdown),
                 payload,
             )
-        plan = GeneralSkillExecutionPlan.model_validate(raw)
+        try:
+            plan = GeneralSkillExecutionPlan.model_validate(raw)
+        except ValidationError as exc:
+            raise LLMError(f"General skill repaired plan has invalid schema: {exc}") from exc
         plan.runtime = _plan_runtime(plan)
         if not plan.code.strip():
             raise LLMError("General skill repaired runner code is empty")

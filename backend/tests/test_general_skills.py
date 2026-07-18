@@ -2321,6 +2321,60 @@ def test_strip_markdown_link_wrapping_leaves_genuine_markdown_links_alone() -> N
     assert _strip_markdown_link_wrapping(code) == code
 
 
+def test_general_skill_runner_recovers_when_plan_json_has_wrong_shape(monkeypatch) -> None:
+    # 模型偶尔会在 Plan 阶段返回别的阶段形状的 JSON（实测出现过把 selector 输出
+    # 当 plan 交上来）。这必须走已有的计划修复循环恢复，而不是让 pydantic
+    # ValidationError 炸穿成整轮 AGENT_LOOP_ERROR。
+    calls: list[str] = []
+
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
+        if "代码修复器" in prompt_text:
+            calls.append("repair")
+            return {
+                "runtime": "python",
+                "code": "import json\nprint(json.dumps({'success': True}, ensure_ascii=False))\n",
+                "rationale": "修复后的正确计划",
+            }
+        if "通用技能执行器" in prompt_text:
+            calls.append("runner")
+            # 错形状：selector 的输出结构，缺少 plan 必需的 code 字段
+            return {"use_general_skill": False, "reason": "串到别的阶段的输出"}
+        if "通用技能结果回复器" in prompt_text:
+            calls.append("reply")
+            return {"reply": "已完成。"}
+        raise AssertionError("unexpected prompt")
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+
+    skill = GeneralSkill(
+        tenant_id="tenant_demo",
+        slug="demo-calc-skill",
+        name="示例计算技能",
+        description="示例计算技能",
+        skill_markdown="# 示例计算技能\n",
+        status="published",
+    )
+    model_config = ModelConfig(
+        tenant_id="tenant_demo",
+        name="Fake model",
+        api_key_encrypted=encrypt_secret("test-key"),
+        model="fake",
+        is_default=True,
+        enabled=True,
+    )
+
+    response = GeneralSkillRunner().run(skill, "跑一下", model_config, max_attempts=2)
+
+    assert calls == ["runner", "repair", "reply"]
+    assert response.structured_result["success"] is True
+    assert response.reply == "已完成。"
+
+
 def test_strip_markdown_link_wrapping_is_noop_without_the_pattern() -> None:
     code = 'url = "http://127.0.0.1:8901/schedule"\nprint(requests.get(url).json())\n'
     assert _strip_markdown_link_wrapping(code) == code
