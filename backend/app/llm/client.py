@@ -19,6 +19,7 @@ from app.llm.stage_protocol import (
     STAGE_PROTOCOL_KEY,
     TURN_STAGE_MESSAGES_KEY,
     render_stage_user_message,
+    stage_static_system_suffix,
 )
 from app.observability.spans import current_llm_operation, llm_span_attributes, start_llm_call
 from app.security.encryption import decrypt_secret
@@ -76,6 +77,7 @@ class LLMClient:
         user_payload: dict[str, Any] | str,
         response_format: dict[str, str] | None = None,
     ) -> str:
+        system_prompt = _stage_augmented_system_prompt(system_prompt, user_payload)
         max_output_tokens = operation_output_tokens(
             current_llm_operation(), self.max_output_tokens
         )
@@ -162,6 +164,7 @@ class LLMClient:
     def generate_text_stream(
         self, system_prompt: str, user_payload: dict[str, Any] | str
     ) -> Iterator[str]:
+        system_prompt = _stage_augmented_system_prompt(system_prompt, user_payload)
         max_output_tokens = operation_output_tokens(
             current_llm_operation(), self.max_output_tokens
         )
@@ -504,6 +507,26 @@ def _thinking_request_kwargs(mode: Any, extra_body: Any = None) -> dict[str, Any
             "type": normalized,
         }
     return {"extra_body": body} if body else {}
+
+
+def _stage_augmented_system_prompt(
+    system_prompt: str, user_payload: dict[str, Any] | str
+) -> str:
+    # Promote the immutable stage sections (phase, rules, output contract)
+    # into the system message: they're byte-identical for every call of the
+    # same phase, and the system message is the one position in the request
+    # that stays ahead of all history, so provider prefix caches can reuse
+    # them across turns and fresh sessions alike. The per-call remainder
+    # stays in the last user message (see render_stage_user_message).
+    if not isinstance(user_payload, dict):
+        return system_prompt
+    stage = user_payload.get(STAGE_PROTOCOL_KEY)
+    if not isinstance(stage, dict):
+        return system_prompt
+    suffix = stage_static_system_suffix(stage)
+    if not suffix:
+        return system_prompt
+    return system_prompt.rstrip() + "\n\n---\n\n" + suffix
 
 
 def _request_messages(

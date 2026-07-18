@@ -485,20 +485,25 @@ def test_stage_input_uses_stable_history_and_puts_instructions_before_volatile_c
     assert client.generate_text("stable unified system", payload) == "ok"
 
     messages = client.client.chat.completions.calls[0]["messages"]
-    assert messages[0] == {"role": "system", "content": "stable unified system"}
+    # The immutable stage sections (phase, thinking requirement, stage rules,
+    # output contract) are promoted into the system message so each phase has
+    # a byte-stable request prefix ahead of any history; only per-call
+    # content remains in the last user message, with the user's raw input at
+    # the very end.
+    system_content = messages[0]["content"]
+    assert messages[0]["role"] == "system"
+    assert system_content.startswith("stable unified system")
+    assert "当前阶段：\nRouter" in system_content
+    assert "思考要求：" in system_content
+    assert "保留完成当前阶段所需的简短思考" in system_content
+    assert "阶段规则：\n只根据技能摘要路由。" in system_content
     assert messages[1:4] == [
         {"role": "user", "content": "历史的信息可以被总结为：\n用户是研发人员"},
         {"role": "user", "content": "近期的历史信息总结为：\n正在咨询差旅"},
         {"role": "assistant", "content": "请说明本次需求"},
     ]
     current = messages[-1]["content"]
-    # Static/stable content (phase, thinking requirement, stage instructions) must
-    # come first so provider-side prompt-prefix caching isn't broken by a per-call
-    # timestamp or the user's raw message; volatile content stays last.
-    assert current.startswith("当前阶段：\nRouter")
-    assert "思考要求：" in current
-    assert "保留完成当前阶段所需的简短思考" in current
-    assert current.index("只根据技能摘要路由。") < current.index("本轮时间：")
+    assert "阶段规则" not in current
     assert current.index("available_skills") < current.index("本轮用户输入：")
     assert "本轮时间：\n2026-07-13T20:30:00+08:00" in current
     assert "本轮用户输入：\n我想申请报销" in current
@@ -559,10 +564,15 @@ def test_stage_requests_append_each_input_and_output_to_one_turn_context() -> No
 
     first_request = client.client.chat.completions.calls[0]["messages"]
     second_request = client.client.chat.completions.calls[1]["messages"]
-    assert first_request[0] == second_request[0] == {
-        "role": "system",
-        "content": "stable unified system",
-    }
+    # 每个阶段的 system 消息 = 共享基础前缀 + 该阶段自己的静态段落；
+    # 同一阶段跨调用字节级一致，可被 provider 前缀缓存复用。
+    assert first_request[0]["role"] == second_request[0]["role"] == "system"
+    assert first_request[0]["content"].startswith("stable unified system")
+    assert second_request[0]["content"].startswith("stable unified system")
+    assert "当前阶段：\nRouter" in first_request[0]["content"]
+    assert "阶段规则：\n选择处理路径。" in first_request[0]["content"]
+    assert "当前阶段：\nStep Agent" in second_request[0]["content"]
+    assert "阶段规则：\n执行当前步骤。" in second_request[0]["content"]
     assert second_request[1:3] == stable_messages[:2]
     assert second_request[3] == first_request[-1]
     assert second_request[4] == {
@@ -570,7 +580,7 @@ def test_stage_requests_append_each_input_and_output_to_one_turn_context() -> No
         "content": '{"decision":"answer_only","confidence":0.9}',
     }
     assert second_request[5]["role"] == "user"
-    assert "当前阶段：\nStep Agent" in second_request[5]["content"]
+    assert "当前阶段独有内容" in second_request[5]["content"]
     assert "本轮用户输入：" not in second_request[5]["content"]
     assert sum(
         "本轮用户输入：" in str(message["content"])

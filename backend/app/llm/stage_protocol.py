@@ -162,28 +162,15 @@ def render_stage_user_message(
     stage = payload.pop(STAGE_PROTOCOL_KEY, {})
     user_message = str(payload.pop("user_message", "") or "").strip()
     projected = _drop_empty_values(payload)
-    output_contract = stage.get("output_contract") if isinstance(stage, dict) else None
-    if not isinstance(output_contract, str):
-        output_contract = json.dumps(
-            output_contract or {}, ensure_ascii=False, separators=(",", ":")
-        )
-    # Static/highly-reused content goes first, volatile content last. Providers
-    # (DeepSeek, OpenAI-compatible proxies, etc.) cache the longest matching
-    # prefix of a request; a per-call timestamp or the user's raw message
-    # placed ahead of the large, stable stage instructions (e.g. a skill's
-    # full SKILL.md) breaks the prefix at the first byte and defeats caching
-    # for everything that follows, even though that content is identical
-    # across calls. Keeping the actual user question last also matches
-    # standard prompting practice (closest to where generation begins).
-    sections = [
-        f"当前阶段：\n{stage.get('phase') or '未指定'}",
-        (
-            "思考要求：\n保留完成当前阶段所需的简短思考；不要复述上下文、逐字段展开检查、"
-            "罗列无关备选方案或反复验证已明确的信息。得到可靠结论后立即按输出约束作答。"
-        ),
-        f"阶段规则：\n{str(stage.get('instructions') or '').strip()}",
-        f"输出约束：\n{output_contract}",
-    ]
+    # The static stage sections (当前阶段/思考要求/阶段规则/输出约束) live in
+    # the system prompt now — see stage_static_system_suffix. Keeping them out
+    # of the per-call user message means every phase gets a fully immutable
+    # request prefix (base prompt + skill doc + stage rules) that providers'
+    # prefix caches can reuse across turns and even across fresh sessions,
+    # instead of re-billing those bytes at a position that shifts with the
+    # conversation history. Only per-call content remains below; the user's
+    # question stays last (closest to where generation begins).
+    sections = []
     if include_turn_header:
         sections.append(f"用户记忆：\n{stage.get('memory') or '无'}")
     sections.append(
@@ -198,6 +185,32 @@ def render_stage_user_message(
             ]
         )
     return "\n\n".join(sections)
+
+
+def stage_static_system_suffix(stage: dict[str, Any]) -> str:
+    """Render the immutable-per-phase stage sections for the system prompt.
+
+    These four sections are byte-identical for every call of the same phase
+    (and skill), so hosting them in the system prompt — ahead of any
+    conversation history — keeps them inside the provider's cacheable
+    request prefix regardless of how the session evolves.
+    """
+    output_contract = stage.get("output_contract")
+    if not isinstance(output_contract, str):
+        output_contract = json.dumps(
+            output_contract or {}, ensure_ascii=False, separators=(",", ":")
+        )
+    return "\n\n".join(
+        [
+            f"当前阶段：\n{stage.get('phase') or '未指定'}",
+            (
+                "思考要求：\n保留完成当前阶段所需的简短思考；不要复述上下文、逐字段展开检查、"
+                "罗列无关备选方案或反复验证已明确的信息。得到可靠结论后立即按输出约束作答。"
+            ),
+            f"阶段规则：\n{str(stage.get('instructions') or '').strip()}",
+            f"输出约束：\n{output_contract}",
+        ]
+    )
 
 
 def _memory_text(items: list[dict[str, object]]) -> str:
